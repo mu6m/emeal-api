@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/index.go": {
+    "main.go": {
       "runtime": "go1.x"
     }
   },
