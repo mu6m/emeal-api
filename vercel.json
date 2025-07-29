@@ -1,7 +1,13 @@
 {
   "functions": {
-    "main.go": {
+    "api/index.go": {
       "runtime": "vercel-go@3.0.0"
     }
-  }
+  },
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/api"
+    }
+  ]
 }
