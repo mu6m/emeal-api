@@ -3,7 +3,6 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -350,10 +349,7 @@ func handleMCPToolCall(c *gin.Context, req MCPRequest) {
 		c.JSON(http.StatusOK, MCPResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Error: &MCPError{
-				Code:    -32602,
-				Message: "Invalid params",
-			},
+			Error: &MCPError{Code: -32602, Message: "Invalid params"},
 		})
 		return
 	}
@@ -361,70 +357,40 @@ func handleMCPToolCall(c *gin.Context, req MCPRequest) {
 	name, _ := params["name"].(string)
 	arguments, _ := params["arguments"].(map[string]interface{})
 
+	var result interface{}
+
 	switch name {
 	case "search_recipes":
-		result := mcpSearchRecipes(arguments)
-		c.JSON(http.StatusOK, MCPResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: map[string]interface{}{
-				"content": []map[string]interface{}{
-					{
-						"type": "text",
-						"text": result,
-					},
-				},
-			},
-		})
+		result = mcpSearchRecipesJSON(arguments)
 	case "get_recipe":
 		if id, ok := arguments["id"].(float64); ok {
-			result := mcpGetRecipe(int(id))
-			c.JSON(http.StatusOK, MCPResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Result: map[string]interface{}{
-					"content": []map[string]interface{}{
-						{
-							"type": "text",
-							"text": result,
-						},
-					},
-				},
-			})
+			result = mcpGetRecipeJSON(int(id))
 		} else {
 			c.JSON(http.StatusOK, MCPResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Error: &MCPError{
-					Code:    -32602,
-					Message: "Invalid recipe ID",
-				},
+				JSONRPC: "2.0", ID: req.ID,
+				Error: &MCPError{Code: -32602, Message: "Invalid recipe ID"},
 			})
+			return
 		}
 	case "get_diet_plans":
-		result := mcpGetDietPlans()
-		c.JSON(http.StatusOK, MCPResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: map[string]interface{}{
-				"content": []map[string]interface{}{
-					{
-						"type": "text",
-						"text": result,
-					},
-				},
-			},
-		})
+		result = mcpGetDietPlansJSON()
 	default:
 		c.JSON(http.StatusOK, MCPResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Error: &MCPError{
-				Code:    -32601,
-				Message: "Tool not found",
-			},
+			JSONRPC: "2.0", ID: req.ID,
+			Error: &MCPError{Code: -32601, Message: "Tool not found"},
 		})
+		return
 	}
+
+	c.JSON(http.StatusOK, MCPResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Result: map[string]interface{}{
+			"content": []map[string]interface{}{
+				{"type": "application/json", "data": result},
+			},
+		},
+	})
 }
 
 func handleMCPResourcesList(c *gin.Context, req MCPRequest) {
@@ -490,19 +456,16 @@ func handleMCPResourcesRead(c *gin.Context, req MCPRequest) {
 	}
 }
 
-// MCP Tool Implementation Functions
-func mcpSearchRecipes(args map[string]interface{}) string {
+func mcpSearchRecipesJSON(args map[string]interface{}) interface{} {
 	query := "SELECT id, name, description, image, prep_time_minutes, cook_time_minutes, total_time_minutes, servings, rating, ingredients, instructions, calories, protein, fat, carbs, fiber, sodium FROM recipes WHERE 1=1"
 	sqlArgs := []interface{}{}
 
-	// Apply diet plan filters if specified
 	if diet, ok := args["diet"].(string); ok && diet != "" {
 		if plan, exists := dietPlans[diet]; exists {
 			query, sqlArgs = applyDietFilters(query, sqlArgs, plan.Filters)
 		}
 	}
 
-	// Apply other filters
 	filters := map[string]string{
 		"search": "AND (name LIKE ? OR description LIKE ?)",
 		"include_ingredients": "AND ingredients LIKE ?",
@@ -547,7 +510,6 @@ func mcpSearchRecipes(args map[string]interface{}) string {
 		}
 	}
 
-	// Sorting
 	sortBy := "id"
 	sortOrder := "asc"
 	if val, ok := args["sort_by"].(string); ok && val != "" {
@@ -575,7 +537,7 @@ func mcpSearchRecipes(args map[string]interface{}) string {
 
 	rows, err := db.Query(query, sqlArgs...)
 	if err != nil {
-		return fmt.Sprintf("Error searching recipes: %v", err)
+		return map[string]interface{}{"error": err.Error()}
 	}
 	defer rows.Close()
 
@@ -593,7 +555,6 @@ func mcpSearchRecipes(args map[string]interface{}) string {
 			continue
 		}
 
-		// Parse JSON strings into slices
 		if ingredientsJSON != "" {
 			json.Unmarshal([]byte(ingredientsJSON), &recipe.Ingredients)
 		}
@@ -604,15 +565,14 @@ func mcpSearchRecipes(args map[string]interface{}) string {
 		recipes = append(recipes, recipe)
 	}
 
-	result, _ := json.MarshalIndent(map[string]interface{}{
+	return map[string]interface{}{
 		"recipes": recipes,
 		"count":   len(recipes),
-	}, "", "  ")
-
-	return string(result)
+	}
 }
 
-func mcpGetRecipe(id int) string {
+
+func mcpGetRecipeJSON(id int) interface{} {
 	query := "SELECT id, name, description, image, prep_time_minutes, cook_time_minutes, total_time_minutes, servings, rating, ingredients, instructions, calories, protein, fat, carbs, fiber, sodium FROM recipes WHERE id = ?"
 
 	var recipe Recipe
@@ -625,14 +585,12 @@ func mcpGetRecipe(id int) string {
 		&recipe.Calories, &recipe.Protein, &recipe.Fat, &recipe.Carbs, &recipe.Fiber, &recipe.Sodium)
 
 	if err == sql.ErrNoRows {
-		return fmt.Sprintf("Recipe with ID %d not found", id)
+		return map[string]interface{}{"error": "Recipe not found"}
 	}
-
 	if err != nil {
-		return fmt.Sprintf("Error fetching recipe: %v", err)
+		return map[string]interface{}{"error": err.Error()}
 	}
 
-	// Parse JSON strings into slices
 	if ingredientsJSON != "" {
 		json.Unmarshal([]byte(ingredientsJSON), &recipe.Ingredients)
 	}
@@ -640,15 +598,13 @@ func mcpGetRecipe(id int) string {
 		json.Unmarshal([]byte(instructionsJSON), &recipe.Instructions)
 	}
 
-	result, _ := json.MarshalIndent(recipe, "", "  ")
-	return string(result)
+	return recipe
 }
 
-func mcpGetDietPlans() string {
-	result, _ := json.MarshalIndent(map[string]interface{}{
+func mcpGetDietPlansJSON() interface{} {
+	return map[string]interface{}{
 		"diet_plans": dietPlans,
-	}, "", "  ")
-	return string(result)
+	}
 }
 
 // Original API Handlers (unchanged)
@@ -1084,5 +1040,4 @@ func main() {
 		port = "8080"
 	}
 	
-	// r := setupRoutes()
 }
