@@ -8,6 +8,11 @@ import (
 	"strconv"
 	"strings"
 
+
+	"bytes"	
+	"fmt"
+	"net/url"
+
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	_ "github.com/go-sql-driver/mysql"
@@ -154,8 +159,8 @@ var dietPlans = map[string]DietPlan{
 			"sort_order": "asc",
 		},
 	},
-	"diabetic": {
-		Name:        "Diabetic Friendly",
+	"low_sugar": {
+		Name:        "Low sugar",
 		Description: "Low sugar, controlled carbs",
 		Filters: map[string]interface{}{
 			"max_carbs": 45,
@@ -272,7 +277,7 @@ func handleMCPToolsList(c *gin.Context, req MCPRequest) {
 					},
 					"diet": map[string]interface{}{
 						"type":        "string",
-						"description": "Diet plan filter (keto, paleo, mediterranean, vegan, vegetarian, low_carb, high_protein, low_sodium, diabetic, heart_healthy)",
+						"description": "Diet plan filter (keto, paleo, mediterranean, vegan, vegetarian, low_carb, high_protein, low_sodium, heart_healthy)",
 					},
 					"include_ingredients": map[string]interface{}{
 						"type":        "string",
@@ -989,6 +994,243 @@ func getRecipeByID(c *gin.Context) {
 	
 	c.JSON(http.StatusOK, recipe)
 }
+type ChatRequest struct {
+	Message string `json:"message" binding:"required"`
+}
+
+type ChatResponse struct {
+	GeneratedURL string `json:"generated_url"`
+	ParsedQuery  string `json:"parsed_query"`
+	Recipes      interface{} `json:"recipes,omitempty"`
+}
+
+func GenerateRecipeURL(message string) (string, error) {
+	systemPrompt := `You are a recipe search API parameter generator. Convert natural language requests into URL query parameters for a recipe search API.
+
+Available parameters:
+- search: text search in recipe name/description
+- diet: keto, paleo, mediterranean, vegan, vegetarian, low_carb, high_protein, low_sodium, heart_healthy, low_sugar
+- include_ingredients: comma-separated ingredients to include
+- exclude_ingredients: comma-separated ingredients to exclude
+- min_calories, max_calories: calorie range
+- min_protein, max_protein: protein range in grams
+- min_carbs, max_carbs: carbs range in grams
+- min_fat, max_fat: fat range in grams
+- min_fiber, max_fiber: fiber range in grams
+- min_sodium, max_sodium: sodium range in mg
+- min_prep_time, max_prep_time: preparation time in minutes
+- min_cook_time, max_cook_time: cooking time in minutes
+- min_total_time, max_total_time: total time in minutes
+- min_servings, max_servings: serving size range
+- min_rating, max_rating: rating range (0-5)
+- sort_by: rating, calories, protein, carbs, prep_time_minutes, etc.
+- sort_order: asc or desc
+
+Examples:
+"high calorie meal with potato" -> "?min_calories=800&include_ingredients=potato&sort_by=calories&sort_order=desc"
+"vegan low carb under 30 minutes" -> "?diet=vegan&max_carbs=20&max_prep_time=30"
+"keto recipes with chicken" -> "?diet=keto&include_ingredients=chicken"
+"healthy low sodium meals" -> "?max_sodium=1000&diet=heart_healthy"
+
+Respond ONLY with the URL query string starting with "?". No explanations.`
+
+	reqBody := map[string]interface{}{
+		"messages": []map[string]interface{}{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": fmt.Sprintf("Convert this request to URL parameters: %s", message)},
+		},
+		"model":  "meta-llama/Llama-3.3-70B-Instruct:fireworks-ai",
+		"stream": false,
+	}
+
+	reqBodyJSON, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest("POST", "https://router.huggingface.co/v1/chat/completions", bytes.NewBuffer(reqBodyJSON))
+	req.Header.Set("Authorization", "Bearer " + os.Getenv("HF_TOKEN"))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var aiResponse struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	json.NewDecoder(resp.Body).Decode(&aiResponse)
+	
+	if len(aiResponse.Choices) == 0 {
+		return "", fmt.Errorf("empty response")
+	}
+
+	generatedURL := strings.TrimSpace(aiResponse.Choices[0].Message.Content)
+	if !strings.HasPrefix(generatedURL, "?") {
+		generatedURL = "?" + generatedURL
+	}
+
+	return generatedURL, nil
+}
+
+func ExecuteSearch(urlParams string) (interface{}, error) {
+	u, err := url.Parse("https://emealapi.ledraa.com/api" + urlParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse URL: %v", err)
+	}
+
+	query := "SELECT id, name, description, image, prep_time_minutes, cook_time_minutes, total_time_minutes, servings, rating, ingredients, instructions, calories, protein, fat, carbs, fiber, sodium FROM recipes WHERE 1=1"
+	args := []interface{}{}
+
+	params := u.Query()
+
+	if diet := params.Get("diet"); diet != "" {
+		if plan, exists := dietPlans[diet]; exists {
+			query, args = applyDietFilters(query, args, plan.Filters)
+		}
+	}
+
+	filterMap := map[string]string{
+		"min_calories": "AND calories >= ?",
+		"max_calories": "AND calories <= ?",
+		"min_protein":  "AND protein >= ?",
+		"max_protein":  "AND protein <= ?",
+		"min_carbs":    "AND carbs >= ?",
+		"max_carbs":    "AND carbs <= ?",
+		"min_fat":      "AND fat >= ?",
+		"max_fat":      "AND fat <= ?",
+		"min_fiber":    "AND fiber >= ?",
+		"max_fiber":    "AND fiber <= ?",
+		"min_sodium":   "AND sodium >= ?",
+		"max_sodium":   "AND sodium <= ?",
+		"max_prep_time": "AND prep_time_minutes <= ?",
+		"min_prep_time": "AND prep_time_minutes >= ?",
+	}
+
+	for param, condition := range filterMap {
+		if value := params.Get(param); value != "" {
+			if val, err := strconv.ParseFloat(value, 64); err == nil {
+				query += " " + condition
+				args = append(args, val)
+			}
+		}
+	}
+
+	if includeIngredients := params.Get("include_ingredients"); includeIngredients != "" {
+		ingredients := strings.Split(includeIngredients, ",")
+		for _, ingredient := range ingredients {
+			query += " AND ingredients LIKE ?"
+			args = append(args, "%"+strings.TrimSpace(ingredient)+"%")
+		}
+	}
+
+	if excludeIngredients := params.Get("exclude_ingredients"); excludeIngredients != "" {
+		ingredients := strings.Split(excludeIngredients, ",")
+		for _, ingredient := range ingredients {
+			query += " AND ingredients NOT LIKE ?"
+			args = append(args, "%"+strings.TrimSpace(ingredient)+"%")
+		}
+	}
+
+	if search := params.Get("search"); search != "" {
+		query += " AND (name LIKE ? OR description LIKE ?)"
+		searchTerm := "%" + search + "%"
+		args = append(args, searchTerm, searchTerm)
+	}
+
+	sortBy := params.Get("sort_by")
+	if sortBy == "" {
+		sortBy = "id"
+	}
+	sortOrder := params.Get("sort_order")
+	if sortOrder == "" {
+		sortOrder = "asc"
+	}
+
+	validSortColumns := map[string]bool{
+		"id": true, "name": true, "prep_time_minutes": true, "cook_time_minutes": true,
+		"total_time_minutes": true, "servings": true, "rating": true, "calories": true,
+		"protein": true, "fat": true, "carbs": true, "fiber": true, "sodium": true,
+	}
+
+	if validSortColumns[sortBy] {
+		if sortOrder == "desc" {
+			query += " ORDER BY " + sortBy + " DESC"
+		} else {
+			query += " ORDER BY " + sortBy + " ASC"
+		}
+	}
+
+	query += " LIMIT 20"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var recipes []Recipe
+	for rows.Next() {
+		var recipe Recipe
+		var ingredientsJSON, instructionsJSON string
+
+		err := rows.Scan(&recipe.ID, &recipe.Name, &recipe.Description, &recipe.Image,
+			&recipe.PrepTimeMinutes, &recipe.CookTimeMinutes, &recipe.TotalTimeMinutes,
+			&recipe.Servings, &recipe.Rating, &ingredientsJSON, &instructionsJSON,
+			&recipe.Calories, &recipe.Protein, &recipe.Fat, &recipe.Carbs, &recipe.Fiber, &recipe.Sodium)
+
+		if err != nil {
+			continue
+		}
+
+		if ingredientsJSON != "" {
+			json.Unmarshal([]byte(ingredientsJSON), &recipe.Ingredients)
+		}
+		if instructionsJSON != "" {
+			json.Unmarshal([]byte(instructionsJSON), &recipe.Instructions)
+		}
+
+		recipes = append(recipes, recipe)
+	}
+
+	return map[string]interface{}{
+		"recipes": recipes,
+		"count":   len(recipes),
+	}, nil
+}
+func handleChat(c *gin.Context) {
+	var req ChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	generatedURL, err := GenerateRecipeURL(req.Message)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process message: " + err.Error()})
+		return
+	}
+
+	response := ChatResponse{
+		GeneratedURL: generatedURL,
+		ParsedQuery:  req.Message,
+	}
+
+	if c.Query("execute") == "true" {
+		recipes, err := ExecuteSearch(generatedURL)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to execute search: " + err.Error()})
+			return
+		}
+		response.Recipes = recipes
+	}
+
+	c.JSON(http.StatusOK, response)
+}
 
 func setupRoutes() *gin.Engine {
 	r := gin.Default()
@@ -1015,6 +1257,7 @@ func setupRoutes() *gin.Engine {
 		api.GET("/recipes/search", searchRecipes)
 		api.GET("/recipe/:id", getRecipeByID)
 		api.GET("/diet-plans", getDietPlans)
+		r.POST("/chat", handleChat)
 		api.GET("/health", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"status": "healthy"})
 		})
